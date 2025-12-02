@@ -1,5 +1,5 @@
 # quick_poster_bot.py
-# WEBHOOK VERSION - SIMPLE & ROBUST DEXSCREENER HANDLING
+# ORIGINAL WORKING VERSION - Webhook deployment ready
 
 import os, re, requests, logging, json, datetime, asyncio
 from typing import Optional, Tuple, List
@@ -19,40 +19,6 @@ if not TELEGRAM_TOKEN:
 JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip() or ""
 TARGET_CHANNELS = ["@CODYWHALESCALLS"]
 
-# ================== SIMPLE DEXSCREENER HELPER ==================
-DEX_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens"
-
-def dexscreener_request(addr: str) -> Optional[dict]:
-    """
-    Simple DexScreener request that respects rate limits.
-    Returns JSON data on success, None on failure.
-    """
-    url = f"{DEX_TOKENS_API}/{addr}"
-    headers = {"User-Agent": "Mozilla/5.0 (QuickPosterBot/1.0)"}
-    
-    try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        
-        if resp.status_code == 429:
-            logger.warning(f"DexScreener rate limited (429) for {addr}")
-            return None
-            
-        if resp.status_code != 200:
-            logger.warning(f"DexScreener returned HTTP {resp.status_code} for {addr}")
-            return None
-            
-        return resp.json()
-        
-    except requests.exceptions.Timeout:
-        logger.warning(f"DexScreener timeout for {addr}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"DexScreener request error for {addr}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error in dexscreener_request for {addr}: {e}")
-        return None
-
 # ================== NETWORK DETECTION & SYMBOL LOOKUP ==================
 SESSION = requests.Session()
 
@@ -68,7 +34,8 @@ EVM_RPCS = {
     "ftm": ["https://rpc.ftm.tools", "https://rpc.ankr.com/fantom"],
 }
 
-# Other API endpoints
+# API endpoints
+DEX_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens"
 SOLSCAN_PUBLIC_META = "https://public-api.solscan.io/token/meta"
 JUP_SEARCH = "https://lite-api.jup.ag/ultra/v1/search"
 TRON_TRCSCAN = "https://apilist.tronscanapi.com/api/token_trc20"
@@ -97,51 +64,56 @@ def detect_network_via_dexscreener(ca: str) -> Tuple[str, List[str]]:
     Returns (best_chain, candidate_chains). Picks best by liquidity among pairs
     whose baseToken.address == ca (case-insensitive). Falls back to all pairs if needed.
     """
-    data = dexscreener_request(ca)
-    if not data:
+    try:
+        url = f"{DEX_TOKENS_API}/{ca}"
+        r = SESSION.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        if r.status_code != 200:
+            return "unknown", []
+
+        pairs = (r.json() or {}).get("pairs") or []
+        if not pairs:
+            return "unknown", []
+
+        # Keep only pairs where the *base* token is the CA (most token pages use base side)
+        def is_base_match(p):
+            base_addr = str((p.get("baseToken") or {}).get("address") or "")
+            return base_addr.lower() == ca.lower()
+
+        base_pairs = [p for p in pairs if is_base_match(p)]
+        candidates = base_pairs if base_pairs else pairs
+
+        # Build (chain -> best pair) by liquidity
+        by_chain = {}
+        for p in candidates:
+            chain = (p.get("chainId") or "").lower()
+            liq = float(((p.get("liquidity") or {}).get("usd") or 0) or 0)
+            # keep the max-liquidity pair per chain
+            if chain and (chain not in by_chain or liq > by_chain[chain][0]):
+                by_chain[chain] = (liq, p)
+
+        chain_map = {
+            "ethereum": "eth", "bsc": "bnb", "base": "base", "polygon": "matic",
+            "arbitrum": "arb", "optimism": "op", "avalanche": "avax", "fantom": "ftm",
+            "tron": "tron", "solana": "sol"
+        }
+        
+        # Candidate chains in our internal naming
+        cand_chains = []
+        for chain_raw in by_chain.keys():
+            internal_chain = chain_map.get(chain_raw, chain_raw)
+            if internal_chain not in cand_chains:
+                cand_chains.append(internal_chain)
+
+        # Best chain = max liquidity among candidates
+        if by_chain:
+            best_raw = max(by_chain.items(), key=lambda kv: kv[1][0])[0]
+            best = chain_map.get(best_raw, best_raw)
+            return best, cand_chains
+
+        return "unknown", cand_chains
+    except Exception as e:
+        logger.error(f"DexScreener detection error: {e}")
         return "unknown", []
-
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return "unknown", []
-
-    # Keep only pairs where the *base* token is the CA (most token pages use base side)
-    def is_base_match(p):
-        base_addr = str((p.get("baseToken") or {}).get("address") or "")
-        return base_addr.lower() == ca.lower()
-
-    base_pairs = [p for p in pairs if is_base_match(p)]
-    candidates = base_pairs if base_pairs else pairs
-
-    # Build (chain -> best pair) by liquidity
-    by_chain = {}
-    for p in candidates:
-        chain = (p.get("chainId") or "").lower()
-        liq = float(((p.get("liquidity") or {}).get("usd") or 0) or 0)
-        # keep the max-liquidity pair per chain
-        if chain and (chain not in by_chain or liq > by_chain[chain][0]):
-            by_chain[chain] = (liq, p)
-
-    chain_map = {
-        "ethereum": "eth", "bsc": "bnb", "base": "base", "polygon": "matic",
-        "arbitrum": "arb", "optimism": "op", "avalanche": "avax", "fantom": "ftm",
-        "tron": "tron", "solana": "sol"
-    }
-    
-    # Candidate chains in our internal naming
-    cand_chains = []
-    for chain_raw in by_chain.keys():
-        internal_chain = chain_map.get(chain_raw, chain_raw)
-        if internal_chain not in cand_chains:
-            cand_chains.append(internal_chain)
-
-    # Best chain = max liquidity among candidates
-    if by_chain:
-        best_raw = max(by_chain.items(), key=lambda kv: kv[1][0])[0]
-        best = chain_map.get(best_raw, best_raw)
-        return best, cand_chains
-
-    return "unknown", cand_chains
 
 def check_chain_via_rpc(ca: str, chain: str) -> bool:
     """Check if contract exists on specific chain via RPC using eth_getCode"""
@@ -226,7 +198,7 @@ def detect_network(ca: str) -> str:
     
     return "unknown"
 
-# ================== REST OF THE CODE ==================
+# ================== REST OF THE CODE (unchanged) ==================
 
 def _post_json(url: str, payload: dict, timeout: int = 5) -> dict:
     r = SESSION.post(url, json=payload, timeout=timeout, headers={"Content-Type": "application/json"})
@@ -284,29 +256,33 @@ def sol_symbol_via_jupiter(mint: str) -> Optional[str]:
     return None
 
 def generic_symbol_via_dexscreener(addr: str) -> Optional[str]:
-    data = dexscreener_request(addr)
-    if not data:
+    try:
+        url = f"{DEX_TOKENS_API}/{addr}"
+        r = SESSION.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code != 200:
+            return None
+
+        pairs = r.json().get("pairs") or []
+        if not pairs:
+            return None
+
+        def is_same_base(p):
+            bt = (p.get("baseToken") or {})
+            return str(bt.get("address", "")).lower() == addr.lower()
+
+        filtered = [p for p in pairs if is_same_base(p)]
+        candidates = filtered if filtered else pairs
+
+        def score(p):
+            liq = ((p.get("liquidity") or {}).get("usd") or 0) or 0
+            vol = (p.get("volume24h") or 0) or 0
+            return (float(liq), float(vol))
+
+        best = max(candidates, key=score)
+        sym = ((best.get("baseToken") or {}).get("symbol") or "").upper()
+        return sym or None
+    except Exception:
         return None
-
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return None
-
-    def is_same_base(p):
-        bt = (p.get("baseToken") or {})
-        return str(bt.get("address", "")).lower() == addr.lower()
-
-    filtered = [p for p in pairs if is_same_base(p)]
-    candidates = filtered if filtered else pairs
-
-    def score(p):
-        liq = ((p.get("liquidity") or {}).get("usd") or 0) or 0
-        vol = (p.get("volume24h") or 0) or 0
-        return (float(liq), float(vol))
-
-    best = max(candidates, key=score)
-    sym = ((best.get("baseToken") or {}).get("symbol") or "").upper()
-    return sym or None
 
 def get_symbol_from_ca(ca: str, chain: str) -> Optional[str]:
     """Get symbol for contract address"""
@@ -333,22 +309,26 @@ def get_symbol_from_ca(ca: str, chain: str) -> Optional[str]:
         return generic_symbol_via_dexscreener(ca)
 
 def get_dex_url(chain: str, ca: str) -> Optional[str]:
-    """Get DexScreener URL for token with simple error handling"""
-    data = dexscreener_request(ca)
-    if not data:
+    """Get DexScreener URL for token"""
+    try:
+        url = f"{DEX_TOKENS_API}/{ca}"
+        r = SESSION.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code != 200:
+            return None
+            
+        pairs = r.json().get("pairs") or []
+        if not pairs:
+            return None
+            
+        # Find the best pair by liquidity
+        def score(p):
+            liq = ((p.get("liquidity") or {}).get("usd") or 0) or 0
+            return float(liq)
+            
+        best = max(pairs, key=score)
+        return best.get("url")
+    except Exception:
         return None
-        
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return None
-        
-    # Find the best pair by liquidity
-    def score(p):
-        liq = ((p.get("liquidity") or {}).get("usd") or 0) or 0
-        return float(liq)
-        
-    best = max(pairs, key=score)
-    return best.get("url")
 
 # ================== CHINESE TEMPLATE GENERATION ==================
 def generate_chinese_caption(symbol: str, chain: str, ca: str, socials: dict) -> str:
@@ -356,7 +336,7 @@ def generate_chinese_caption(symbol: str, chain: str, ca: str, socials: dict) ->
     
     chain_label = CHAIN_LABELS_ZH.get(chain, chain.upper())
     
-    # Get DexScreener URL with error handling
+    # Get DexScreener URL
     chart_url = get_dex_url(chain, ca)
     
     # Build main caption in your exact format (no emojis)
@@ -369,10 +349,7 @@ def generate_chinese_caption(symbol: str, chain: str, ca: str, socials: dict) ->
     else:
         caption += f"{chain_label}（原生资产）\n\n"
     
-    if chart_url:
-        caption += f"CHART: {chart_url}"
-    else:
-        caption += "CHART: N/A"
+    caption += f"CHART: {chart_url or 'N/A'}"
     
     # Add social links if provided
     tail_lines = []
@@ -488,11 +465,10 @@ async def process_ca_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await processing_msg.edit_text("Could not detect network. Please try a different CA.")
             return
         
-        # Get symbol with robust fallback
+        # Get symbol
         symbol = get_symbol_from_ca(ca, chain)
         if not symbol:
             symbol = "TOKEN"
-            logger.info(f"No symbol found for {ca} on {chain}, using default 'TOKEN'")
         
         # Store data - start with fresh socials for each token
         context.user_data.clear()
@@ -533,11 +509,8 @@ async def choose_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("Please paste the contract address again.")
         return
     
-    # Get symbol for chosen chain with fallback
-    symbol = get_symbol_from_ca(ca, chosen)
-    if not symbol:
-        symbol = "TOKEN"
-        logger.info(f"No symbol found for {ca} on {chosen}, using default 'TOKEN'")
+    # Get symbol for chosen chain
+    symbol = get_symbol_from_ca(ca, chosen) or "TOKEN"
     
     # Store data
     context.user_data.clear()
