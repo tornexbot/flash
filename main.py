@@ -1,12 +1,11 @@
 # quick_poster_bot.py
-# WEBHOOK VERSION + ROBUST DEXSCREENER WITH RETRY LOGIC
+# WEBHOOK VERSION - SIMPLE & ROBUST DEXSCREENER HANDLING
 
-import os, re, requests, logging, json, datetime, asyncio, time
+import os, re, requests, logging, json, datetime, asyncio
 from typing import Optional, Tuple, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, constants
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from io import BytesIO
-from requests.exceptions import RequestException
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -20,30 +19,39 @@ if not TELEGRAM_TOKEN:
 JUP_API_KEY = os.getenv("JUP_API_KEY", "").strip() or ""
 TARGET_CHANNELS = ["@CODYWHALESCALLS"]
 
-# ================== ROBUST DEXSCREENER HELPER ==================
+# ================== SIMPLE DEXSCREENER HELPER ==================
 DEX_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens"
 
-def dexscreener_request(addr: str, timeout: int = 6, retries: int = 3, backoff: float = 0.5):
+def dexscreener_request(addr: str) -> Optional[dict]:
     """
-    Try to fetch JSON from DexScreener, with retries on failure.
-    Returns dict on success, or None on repeated failure.
+    Simple DexScreener request that respects rate limits.
+    Returns JSON data on success, None on failure.
     """
     url = f"{DEX_TOKENS_API}/{addr}"
-    headers = {"User-Agent": "Mozilla/5.0 (QuickPosterBot)"}
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                logger.warning(f"DexScreener returned HTTP {resp.status_code} for {addr}, attempt {attempt}")
-        except RequestException as e:
-            last_err = e
-            logger.warning(f"DexScreener request error for {addr}, attempt {attempt}: {e}")
-        time.sleep(backoff * (2 ** (attempt - 1)))  # exponential backoff
-    logger.error(f"DexScreener failed for {addr} after {retries} attempts. Last error: {last_err}")
-    return None
+    headers = {"User-Agent": "Mozilla/5.0 (QuickPosterBot/1.0)"}
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        
+        if resp.status_code == 429:
+            logger.warning(f"DexScreener rate limited (429) for {addr}")
+            return None
+            
+        if resp.status_code != 200:
+            logger.warning(f"DexScreener returned HTTP {resp.status_code} for {addr}")
+            return None
+            
+        return resp.json()
+        
+    except requests.exceptions.Timeout:
+        logger.warning(f"DexScreener timeout for {addr}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"DexScreener request error for {addr}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error in dexscreener_request for {addr}: {e}")
+        return None
 
 # ================== NETWORK DETECTION & SYMBOL LOOKUP ==================
 SESSION = requests.Session()
@@ -325,7 +333,7 @@ def get_symbol_from_ca(ca: str, chain: str) -> Optional[str]:
         return generic_symbol_via_dexscreener(ca)
 
 def get_dex_url(chain: str, ca: str) -> Optional[str]:
-    """Get DexScreener URL for token with robust error handling"""
+    """Get DexScreener URL for token with simple error handling"""
     data = dexscreener_request(ca)
     if not data:
         return None
@@ -364,7 +372,7 @@ def generate_chinese_caption(symbol: str, chain: str, ca: str, socials: dict) ->
     if chart_url:
         caption += f"CHART: {chart_url}"
     else:
-        caption += "CHART: N/A (DexScreener data unavailable)"
+        caption += "CHART: N/A"
     
     # Add social links if provided
     tail_lines = []
